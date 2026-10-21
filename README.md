@@ -127,18 +127,6 @@ streamlit run app/app.py
 # Opens at http://localhost:8501
 ```
 
-### 5. Deploy to Streamlit Community Cloud
-```bash
-# Push to GitHub
-git add .
-git commit -m "UPI360: End-to-end analytics platform"
-git push origin main
-
-# Deploy at https://share.streamlit.io
-# (Connect GitHub repo, select app/app.py as main file)
-```
-
----
 
 ## 📈 SQL Layer: 10 Analytical Queries
 
