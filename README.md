@@ -58,7 +58,7 @@ India's UPI system has experienced exponential growth since its launch in 2017. 
 - **Volatility**: 108% coefficient of variation (high during early years, stabilizing)
 
 ### 4. AI Assistant: Rule-Based + LLM Hybrid
-- **Accuracy**: 60% on 15 diverse questions
+- **Accuracy**: 86% on 15 diverse questions
 - **Coverage**: 10 predefined patterns handle ~70% of common queries
 - **Fallback**: Gemini API for unseen questions (graceful degradation)
 - **Safety**: Read-only SQL, schema validation, result sanity checks
