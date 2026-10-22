@@ -1,205 +1,164 @@
-"""ML Layers: Forecast, Segmentation, Anomaly Detection with SHAP."""
-import pandas as pd
-import numpy as np
-import duckdb
-from datetime import datetime, timedelta
-import warnings
-warnings.filterwarnings('ignore')
+"""ML layers on the full UPI monthly series (all months, no row dropped).
 
-# For forecasting
-from sklearn.preprocessing import StandardScaler
+1. Forecast  : 6-month holdout, naive vs drift vs damped ETS, best model refit on all data
+2. Phases    : K-means (k=3) on log volume -> launch / scale-up / mature
+3. Anomalies : Isolation Forest on detrended growth + ticket-size change
+Also: detrended seasonality (ratio to centred 12-month average) + festive test.
+
+Run from anywhere:  python src/models.py
+Writes: DuckDB tables, reports/ml_models_report.md, reports/dashboard_data.json
+"""
+import json
+import warnings
+from pathlib import Path
+
+import duckdb
+import numpy as np
+import pandas as pd
+from scipy import stats
 from sklearn.cluster import KMeans
 from sklearn.ensemble import IsolationForest
-from sklearn.metrics import mean_absolute_percentage_error
+from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-# Load and prepare data
-db = duckdb.connect("data/upi.duckdb")
-df = db.execute("SELECT * FROM upi_monthly ORDER BY date").fetch_df()
-df['date'] = pd.to_datetime(df['date'])
-df['volume_mn'] = pd.to_numeric(df['volume_mn'], errors='coerce')
-df['value_cr'] = pd.to_numeric(df['value_cr'], errors='coerce')
-df = df.sort_values('date').reset_index(drop=True)
+warnings.filterwarnings("ignore")
+ROOT = Path(__file__).resolve().parent.parent
+DB = ROOT / "data" / "upi.duckdb"
+HOLDOUT, HORIZON, SEED = 6, 6, 42
 
-print("=" * 80)
-print("MACHINE LEARNING LAYERS")
-print("=" * 80)
+con = duckdb.connect(str(DB))
+df = con.execute("SELECT date, num_banks, volume_mn, value_cr FROM upi_monthly ORDER BY date").df()
+df["date"] = pd.to_datetime(df["date"])
+df = df.set_index("date")
+df["ticket"] = df["value_cr"] * 1e7 / (df["volume_mn"] * 1e6)  # average rupees per transaction
+v = df["volume_mn"]
+n = len(df)
+assert n == 114, f"expected 114 months, found {n}"
 
-# ============================================================================
-# 1. FORECASTING: Simple Baseline vs Prophet
-# ============================================================================
-print("\n[FORECASTING]")
 
-# Baseline: 3-month simple average
-df['baseline_forecast'] = df['volume_mn'].rolling(window=3, min_periods=1).mean().shift(1)
+# ---------------------------------------------------------------- 1. forecast
+def forecast(name, s, h):
+    if name == "naive":
+        return np.repeat(s.iloc[-1], h)
+    if name == "drift_12m":
+        slope = (s.iloc[-1] - s.iloc[-13]) / 12
+        return s.iloc[-1] + slope * np.arange(1, h + 1)
+    if name == "ets_damped_log":
+        fit = ExponentialSmoothing(np.log(s.values), trend="add", damped_trend=True).fit()
+        return np.exp(fit.forecast(h))
+    raise ValueError(name)
 
-# Calculate MAPE only on valid predictions
-valid_idx = (df.index > 12) & df['baseline_forecast'].notna() & df['volume_mn'].notna()
-baseline_mae = mean_absolute_percentage_error(
-    df[valid_idx]['volume_mn'].values, 
-    df[valid_idx]['baseline_forecast'].values
-) * 100
 
-print(f"Baseline (3-month MA) MAPE: {baseline_mae:.2f}%")
+mape = lambda a, p: float(np.mean(np.abs((a - p) / a)) * 100)
+MODELS = ["naive", "drift_12m", "ets_damped_log"]
+train, test = v.iloc[:-HOLDOUT], v.iloc[-HOLDOUT:]
+holdout = {m: forecast(m, train, HOLDOUT) for m in MODELS}
+scores = {m: mape(test.values, holdout[m]) for m in MODELS}
+best = min(scores, key=scores.get)
 
-# Try Prophet if available
-try:
-    from prophet import Prophet
-    
-    prophet_df = df[['date', 'volume_mn']].copy()
-    prophet_df.columns = ['ds', 'y']
-    prophet_df = prophet_df.dropna()
-    
-    model = Prophet(yearly_seasonality=True, daily_seasonality=False, interval_width=0.95)
-    model.fit(prophet_df)
-    
-    future = model.make_future_dataframe(periods=6, freq='MS')
-    forecast = model.predict(future)
-    
-    # Evaluate on last 12 months
-    last_12_actual = prophet_df[prophet_df['ds'] >= prophet_df['ds'].max() - timedelta(days=365)]
-    last_12_pred = forecast[forecast['ds'].isin(last_12_actual['ds'])]
-    
-    if len(last_12_pred) > 0:
-        prophet_mape = mean_absolute_percentage_error(
-            last_12_actual['y'].values,
-            last_12_pred['yhat'].values
-        ) * 100
-        print(f"Prophet MAPE: {prophet_mape:.2f}%")
-        next_6_forecast = forecast[forecast['ds'] > prophet_df['ds'].max()][['ds', 'yhat']].head(6)
-        print("Next 6 months forecast (Prophet):")
-        print(next_6_forecast.to_string(index=False))
-    
-except ImportError:
-    print("Prophet not available, using baseline only")
-except Exception as e:
-    print(f"Prophet error: {e}, using baseline only")
+future_idx = pd.date_range(v.index[-1] + pd.offsets.MonthBegin(1), periods=HORIZON, freq="MS")
+fut = forecast(best, v, HORIZON)
+g = np.log(v).diff().dropna()
+sigma = float(g.iloc[-24:].std())  # recent month-on-month volatility
+steps = np.arange(1, HORIZON + 1)
+lo, hi = fut * np.exp(-1.28 * sigma * np.sqrt(steps)), fut * np.exp(1.28 * sigma * np.sqrt(steps))  # ~80% band
 
-# ============================================================================
-# 2. SEGMENTATION: RFM-like (adapted for aggregate data)
-# ============================================================================
-print("\n[SEGMENTATION: RFM-adapted for aggregate volume]")
+# ------------------------------------------------------------- seasonality
+ratio = (v / v.rolling(12, center=True).mean()).dropna()
+season = ratio.groupby(ratio.index.month).mean()
+festive = ratio[ratio.index.month.isin([10, 11, 12])]
+other = ratio[~ratio.index.month.isin([10, 11, 12])]
+u_stat, p_festive = stats.mannwhitneyu(festive, other, alternative="two-sided")
 
-# Create features for clustering
-features_df = df[['date', 'volume_mn', 'value_cr', 'num_banks']].copy()
-features_df['date_numeric'] = (features_df['date'] - features_df['date'].min()).dt.days
+# ---------------------------------------------------------------- 2. phases
+X = StandardScaler().fit_transform(np.log(v.values).reshape(-1, 1))
+km = KMeans(n_clusters=3, random_state=SEED, n_init=10).fit(X)
+order = np.argsort([v.values[km.labels_ == k].mean() for k in range(3)])
+names = {int(order[0]): "Launch & ramp-up", int(order[1]): "Scale-up", int(order[2]): "Mature"}
+df["phase"] = [names[int(k)] for k in km.labels_]
 
-# Recent volume (last 12 months avg)
-features_df['recency_score'] = features_df['volume_mn'].rolling(window=12, min_periods=1).mean()
+# -------------------------------------------------------------- 3. anomalies
+lg = np.log(v).diff()
+lt = np.log(df["ticket"]).diff()
+dev_v = lg - lg.rolling(12, min_periods=6).median().shift(1)
+dev_t = lt - lt.rolling(12, min_periods=6).median().shift(1)
+feat = pd.DataFrame({"dev_volume": dev_v, "dev_ticket": dev_t}).iloc[13:]
+iso = IsolationForest(contamination=0.06, random_state=SEED, n_estimators=300)
+iso.fit(StandardScaler().fit_transform(feat))
+flag = iso.predict(StandardScaler().fit_transform(feat)) == -1
+score = -iso.score_samples(StandardScaler().fit_transform(feat))  # higher = more unusual
+an = feat.copy()
+an["is_anomaly"], an["score"] = flag, score
+an["volume_mn"] = v.loc[an.index]
+an["mom_pct"] = (np.exp(lg.loc[an.index]) - 1) * 100
+an["trend_mom_pct"] = (np.exp(lg.rolling(12, min_periods=6).median().shift(1).loc[an.index]) - 1) * 100
 
-# Frequency of high-volume periods
-features_df['frequency_high'] = (features_df['volume_mn'] > features_df['volume_mn'].quantile(0.75)).astype(int)
+# --------------------------------------------------------------------- save
+def to_db(name, frame):
+    out = frame.copy()
+    out.insert(0, "date", out.index.strftime("%Y-%m-%d"))
+    con.execute(f"DROP TABLE IF EXISTS {name}")
+    con.register("tmp_df", out.reset_index(drop=True))
+    con.execute(f"CREATE TABLE {name} AS SELECT * FROM tmp_df")
+    con.unregister("tmp_df")
 
-# Monetary: transaction value
-features_df['monetary'] = features_df['value_cr']
 
-# Select features for clustering
-X = features_df[['recency_score', 'frequency_high', 'monetary']].dropna()
-X_idx = X.index
+to_db("segments", df[["volume_mn", "phase"]].rename(columns={"phase": "segment_name"}))
+to_db("anomalies", an[["volume_mn", "mom_pct", "trend_mom_pct", "score", "is_anomaly"]])
+to_db("forecast_holdout", pd.DataFrame({"actual": test.values, **{m: holdout[m] for m in MODELS}}, index=test.index))
+to_db("forecast_future", pd.DataFrame({"forecast": fut, "lo80": lo, "hi80": hi}, index=future_idx))
 
-# Standardize
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+phases = []
+for p in ["Launch & ramp-up", "Scale-up", "Mature"]:
+    s = df[df["phase"] == p]
+    phases.append({"name": p, "months": int(len(s)), "from": s.index.min().strftime("%b %Y"),
+                   "to": s.index.max().strftime("%b %Y"), "avg_volume": round(float(s.volume_mn.mean()), 1),
+                   "avg_ticket": round(float(s.ticket.mean()))})
 
-# K-means clustering (3 segments: Low, Medium, High)
-kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-features_df.loc[X_idx, 'segment'] = kmeans.fit_predict(X_scaled)
+flagged = an[an.is_anomaly].sort_values("score", ascending=False)
+payload = {
+    "months": [{"d": d.strftime("%Y-%m"), "b": int(r.num_banks), "v": round(float(r.volume_mn), 2),
+                "c": round(float(r.value_cr), 2), "t": round(float(r.ticket), 1), "p": r.phase}
+               for d, r in df.iterrows()],
+    "forecast": [{"d": d.strftime("%Y-%m"), "f": round(float(f)), "lo": round(float(l)), "hi": round(float(h))}
+                 for d, f, l, h in zip(future_idx, fut, lo, hi)],
+    "holdout": {"months": [d.strftime("%Y-%m") for d in test.index], "actual": [round(float(x)) for x in test],
+                "pred": {m: [round(float(x)) for x in holdout[m]] for m in MODELS},
+                "mape": {m: round(scores[m], 2) for m in MODELS}, "best": best},
+    "season": {str(m): round(float(x), 4) for m, x in season.items()},
+    "festive": {"festive_mean": round(float(festive.mean()), 4), "other_mean": round(float(other.mean()), 4),
+                "p": round(float(p_festive), 4)},
+    "phases": phases,
+    "anomalies": [{"d": d.strftime("%Y-%m"), "v": round(float(r.volume_mn), 1), "mom": round(float(r.mom_pct), 1),
+                   "trend": round(float(r.trend_mom_pct), 1), "s": round(float(r.score), 3), "f": bool(r.is_anomaly)}
+                  for d, r in an.iterrows()],
+}
+(ROOT / "reports").mkdir(exist_ok=True)
+(ROOT / "reports" / "dashboard_data.json").write_text(json.dumps(payload))
 
-# Assign segment names based on centroids
-centroid_volumes = [scaler.inverse_transform(kmeans.cluster_centers_[i].reshape(1, -1))[0][0] for i in range(3)]
-sorted_segments = sorted(enumerate(centroid_volumes), key=lambda x: x[1])
-segment_names_ordered = {old_id: f"Segment {rank}" for rank, (old_id, _) in enumerate(sorted_segments)}
-
-features_df['segment_name'] = features_df['segment'].map(segment_names_ordered)
-
-print("\nSegment Distribution:")
-for seg in features_df['segment_name'].unique():
-    count = (features_df['segment_name'] == seg).sum()
-    avg_vol = features_df[features_df['segment_name'] == seg]['volume_mn'].mean()
-    print(f"  {seg}: {count} months, avg volume {avg_vol:.2f} Mn")
-
-# ============================================================================
-# 3. ANOMALY DETECTION: Isolation Forest
-# ============================================================================
-print("\n[ANOMALY DETECTION: Isolation Forest]")
-
-# Prepare features
-anom_features = df[['volume_mn', 'value_cr', 'num_banks']].copy()
-anom_features['velocity'] = anom_features['value_cr'] / anom_features['volume_mn']
-anom_features_clean = anom_features.dropna()
-
-X_anom = anom_features_clean[['volume_mn', 'velocity']].values
-scaler_anom = StandardScaler()
-X_anom_scaled = scaler_anom.fit_transform(X_anom)
-
-# Isolation Forest
-iso_forest = IsolationForest(contamination=0.1, random_state=42)
-anomalies = iso_forest.fit_predict(X_anom_scaled)
-scores = iso_forest.score_samples(X_anom_scaled)
-
-anom_features_clean['anomaly'] = anomalies
-anom_features_clean['anomaly_score'] = scores
-
-# Merge back to original df
-anomaly_df = pd.DataFrame({
-    'date': df.loc[anom_features_clean.index, 'date'].values,
-    'volume_mn': anom_features_clean['volume_mn'].values,
-    'velocity': anom_features_clean['velocity'].values,
-    'anomaly_score': anom_features_clean['anomaly_score'].values,
-    'is_anomaly': anom_features_clean['anomaly'].values == -1
-})
-
-anomalies_found = anomaly_df[anomaly_df['is_anomaly']].sort_values('anomaly_score')
-print(f"\nAnomalies detected: {len(anomalies_found)}")
-print("\nTop anomalies:")
-print(anomalies_found[['date', 'volume_mn', 'velocity', 'anomaly_score']].head(5).to_string(index=False))
-
-# ============================================================================
-# SAVE RESULTS
-# ============================================================================
-
-# Save segmentation
-features_df_export = features_df[['date', 'volume_mn', 'segment_name']].copy()
-features_df_export['date'] = features_df_export['date'].astype(str)
-db.execute("DROP TABLE IF EXISTS segments")
-db.sql("CREATE TABLE segments AS SELECT * FROM features_df_export")
-
-# Save anomalies
-anomaly_df_export = anomaly_df.copy()
-anomaly_df_export['date'] = anomaly_df_export['date'].astype(str)
-db.execute("DROP TABLE IF EXISTS anomalies")
-db.sql("CREATE TABLE anomalies AS SELECT * FROM anomaly_df_export")
-
-print("\n[SAVED] Segments and anomalies to DuckDB")
-
-# Write summary report
-report = f"""# ML Models Report
-
-## 1. Forecasting
-- **Baseline MAPE:** {baseline_mae:.2f}%
-- **Model:** 3-month moving average
-- **Status:** Baseline established for comparison
-
-## 2. Segmentation (K-Means, k=3)
-- **Features:** Recent volume, frequency of highs, transaction value
-- **Segments:** {len(features_df['segment_name'].unique())} clusters identified
-- **Use:** Identify market phases and volume regimes
-
-## 3. Anomaly Detection (Isolation Forest)
-- **Features:** Volume & transaction velocity
-- **Contamination:** 10%
-- **Anomalies Found:** {len(anomalies_found)}
-- **Top Anomaly:** {anomalies_found.iloc[0]['date'].date()} (volume {anomalies_found.iloc[0]['volume_mn']:.2f} Mn, velocity {anomalies_found.iloc[0]['velocity']:.2f})
-
-## Key Insights
-- System showing exponential growth phase (volumes 30,000%+ over 9 years)
-- Recent growth stabilizing (36.2% YoY vs 225% in 2019)
-- Anomalies concentrated in early years and recent months (system maturation vs new phase)
-
-"""
-
-with open("reports/ml_models_report.md", "w") as f:
-    f.write(report)
-
-print("[LOG] ML report written to reports/ml_models_report.md")
-db.close()
-print("=" * 80)
+lines = [
+    "# ML Models Report", "",
+    f"All results computed on the full series: {n} months, {v.index[0]:%b %Y} to {v.index[-1]:%b %Y}.", "",
+    f"## 1. Forecast (holdout: train to {train.index[-1]:%b %Y}, test {test.index[0]:%b %Y} to {test.index[-1]:%b %Y})", "",
+    "| Model | Holdout MAPE |", "|---|---|",
+    *[f"| {m}{' (selected)' if m == best else ''} | {scores[m]:.2f}% |" for m in MODELS], "",
+    f"Selected model refit on all data. Next {HORIZON} months (approx. 80% band from recent volatility):", "",
+    "| Month | Forecast (M txns) | Low | High |", "|---|---|---|---|",
+    *[f"| {d:%b %Y} | {f:,.0f} | {l:,.0f} | {h:,.0f} |" for d, f, l, h in zip(future_idx, fut, lo, hi)], "",
+    "## 2. Seasonality (detrended: ratio to centred 12-month average)", "",
+    f"- Highest month index: {int(season.idxmax())} ({season.max():.3f}); lowest: {int(season.idxmin())} ({season.min():.3f})",
+    f"- Oct-Dec vs rest, Mann-Whitney p = {p_festive:.4f} (festive mean {festive.mean():.3f} vs {other.mean():.3f})", "",
+    "## 3. Growth phases (K-means k=3 on log volume)", "",
+    "| Phase | Months | Period | Avg volume (M) | Avg ticket (Rs) |", "|---|---|---|---|---|",
+    *[f"| {p['name']} | {p['months']} | {p['from']} to {p['to']} | {p['avg_volume']:,} | {p['avg_ticket']:,} |" for p in phases], "",
+    f"## 4. Anomalies (Isolation Forest, contamination 6%, {len(an)} months scored from {an.index[0]:%b %Y})", "",
+    "Features: deviation of month-on-month volume growth and of ticket-size change from their trailing 12-month median.", "",
+    "| Month | Volume (M) | MoM % | Trend MoM % | Score |", "|---|---|---|---|---|",
+    *[f"| {d:%b %Y} | {r.volume_mn:,.0f} | {r.mom_pct:+.1f} | {r.trend_mom_pct:+.1f} | {r.score:.3f} |" for d, r in flagged.iterrows()], "",
+]
+(ROOT / "reports" / "ml_models_report.md").write_text("\n".join(lines))
+print("best", best, scores)
+print("festive p", round(p_festive, 4))
+print([(p["name"], p["months"], p["from"], p["to"]) for p in phases])
+print(flagged[["volume_mn", "mom_pct", "trend_mom_pct", "score"]].round(2).to_string())
+print(pd.DataFrame({"f": fut, "lo": lo, "hi": hi}, index=future_idx).round(0).to_string())
